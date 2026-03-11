@@ -76,11 +76,7 @@ impl AgentRunner {
             let content = response.content.clone().unwrap_or_default();
             self.emit(
                 EventKind::Status,
-                if content.trim().is_empty() {
-                    format!("iteration {iteration}: status={status}")
-                } else {
-                    format!("iteration {iteration}: status={status} {content}")
-                },
+                status_message(iteration, &status, &content),
                 Some(json!({ "iteration": iteration, "status": status })),
             );
 
@@ -294,6 +290,34 @@ fn first_non_empty(a: Option<String>, b: Option<String>, c: Option<String>) -> S
         .flatten()
         .find(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "No summary provided".to_string())
+}
+
+fn status_message(iteration: usize, status: &str, content: &str) -> String {
+    match status {
+        STATUS_REQUIRES_ACTION | STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED => {
+            format!("iteration {iteration}: status={status}")
+        }
+        _ => {
+            if content.trim().is_empty() {
+                format!("iteration {iteration}: status={status}")
+            } else {
+                format!(
+                    "iteration {iteration}: status={status} {}",
+                    truncate_for_status(content, 180)
+                )
+            }
+        }
+    }
+}
+
+fn truncate_for_status(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 async fn retry_async<F, Fut, T>(attempts: usize, mut f: F) -> Result<T>
