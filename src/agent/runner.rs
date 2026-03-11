@@ -24,6 +24,13 @@ pub struct AgentRunner {
     todos: TodoStore,
     sink: Arc<dyn EventSink>,
     session: Arc<Mutex<Option<AgentSession>>>,
+    model_selection: Arc<Mutex<ModelSelection>>,
+}
+
+#[derive(Clone, Debug)]
+struct ModelSelection {
+    provider: String,
+    model: String,
 }
 
 impl AgentRunner {
@@ -35,6 +42,8 @@ impl AgentRunner {
         todos: TodoStore,
         sink: Arc<dyn EventSink>,
     ) -> Self {
+        let default_provider = config.llm_provider.clone();
+        let default_model = config.model_name.clone();
         Self {
             client,
             config,
@@ -43,16 +52,21 @@ impl AgentRunner {
             todos,
             sink,
             session: Arc::new(Mutex::new(None)),
+            model_selection: Arc::new(Mutex::new(ModelSelection {
+                provider: default_provider,
+                model: default_model,
+            })),
         }
     }
 
     pub async fn run_prompt(&self, run_id: &str, prompt: &str) -> Result<String> {
         let session = self.ensure_session().await?;
+        let (provider, model) = self.current_model();
         self.emit(
             EventKind::Status,
             format!(
-                "run={} assistant={} thread={}",
-                run_id, session.assistant_id, session.thread_id
+                "run={} assistant={} thread={} model={}/{}",
+                run_id, session.assistant_id, session.thread_id, provider, model
             ),
             Some(json!({ "run_id": run_id })),
         );
@@ -61,8 +75,8 @@ impl AgentRunner {
             .add_message_with_retry(AddMessageRequest {
                 thread_id: session.thread_id.clone(),
                 content: prompt.to_string(),
-                llm_provider: self.config.llm_provider.clone(),
-                model_name: self.config.model_name.clone(),
+                llm_provider: provider,
+                model_name: model,
                 memory: self.config.memory_mode.clone(),
                 web_search: self.config.web_search_mode.clone(),
                 stream: false,
@@ -270,6 +284,32 @@ impl AgentRunner {
             timestamp: Utc::now(),
             metadata,
         });
+    }
+
+    pub fn clear_session(&self) {
+        *self.session.lock().expect("session mutex poisoned") = None;
+        self.emit(
+            EventKind::Status,
+            "conversation cleared; next prompt starts a new thread".to_string(),
+            None,
+        );
+    }
+
+    pub fn set_model(&self, provider: impl Into<String>, model: impl Into<String>) {
+        let mut guard = self
+            .model_selection
+            .lock()
+            .expect("model_selection mutex poisoned");
+        guard.provider = provider.into();
+        guard.model = model.into();
+    }
+
+    pub fn current_model(&self) -> (String, String) {
+        let guard = self
+            .model_selection
+            .lock()
+            .expect("model_selection mutex poisoned");
+        (guard.provider.clone(), guard.model.clone())
     }
 }
 

@@ -9,6 +9,7 @@ use crate::agent::prompts::PromptStore;
 use crate::agent::runner::AgentRunner;
 use crate::backboard::client::BackboardClient;
 use crate::config::Config;
+use crate::runtime::models::ModelCatalog;
 use crate::runtime::todos::TodoStore;
 use crate::tools::registry::ToolRegistry;
 use crate::tui::repl::{create_event_sink, run_repl};
@@ -30,6 +31,7 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
 
     let prompts = PromptStore::load(&config.prompts_dir)?;
+    let model_catalog = ModelCatalog::load(&config.model_catalog_path)?;
     let backboard = BackboardClient::new(
         config.backboard_base_url.clone(),
         config.backboard_api_key.clone(),
@@ -62,5 +64,5 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_repl(&config, runner, todos, rx).await
+    run_repl(&config, runner, todos, model_catalog, rx).await
 }

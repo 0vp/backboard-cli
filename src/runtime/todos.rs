@@ -55,4 +55,8 @@ impl TodoStore {
     pub fn list(&self) -> Vec<TodoItem> {
         self.items.lock().expect("todo mutex poisoned").clone()
     }
+
+    pub fn clear(&self) {
+        self.items.lock().expect("todo mutex poisoned").clear();
+    }
 }

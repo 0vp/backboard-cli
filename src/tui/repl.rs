@@ -1,11 +1,14 @@
 use crate::agent::events::{AgentEvent, EventKind, EventSink};
 use crate::agent::runner::AgentRunner;
 use crate::config::Config;
+use crate::runtime::models::ModelCatalog;
 use crate::runtime::todos::TodoStore;
+use crate::tui::input::{pick_model_with_arrows, ReplHelper};
 use anyhow::Result;
 use chrono::Utc;
 use regex::Regex;
-use rustyline::DefaultEditor;
+use rustyline::history::DefaultHistory;
+use rustyline::Editor;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::cmp::max;
@@ -42,9 +45,10 @@ pub async fn run_repl(
     config: &Config,
     runner: Arc<AgentRunner>,
     todos: TodoStore,
+    model_catalog: ModelCatalog,
     mut rx: UnboundedReceiver<AgentEvent>,
 ) -> Result<()> {
-    print_header(config);
+    print_header(config, &runner);
 
     let todo_store = todos.clone();
     let printer = tokio::spawn(async move {
@@ -56,7 +60,8 @@ pub async fn run_repl(
         }
     });
 
-    let mut editor = DefaultEditor::new()?;
+    let mut editor = Editor::<ReplHelper, DefaultHistory>::new()?;
+    editor.set_helper(Some(ReplHelper::new(model_catalog.clone())));
     let mut turn: u64 = 0;
 
     loop {
@@ -69,6 +74,22 @@ pub async fn run_repl(
         if input.is_empty() {
             continue;
         }
+
+        if input.starts_with('/') {
+            let handled = handle_slash_command(&input, &runner, &todos, &model_catalog);
+            if handled {
+                continue;
+            }
+            if input == "/exit" || input == "/quit" {
+                break;
+            }
+            println!(
+                "  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}Unknown command:{RESET} {input}"
+            );
+            println!("  {DIM}Type / or /help to see available commands.{RESET}\n");
+            continue;
+        }
+
         if input == "/exit" || input == "/quit" {
             break;
         }
@@ -95,14 +116,152 @@ pub async fn run_repl(
     Ok(())
 }
 
-fn print_header(config: &Config) {
+fn print_header(config: &Config, runner: &AgentRunner) {
+    let command_hint = format_inline_markdown("type `/` for commands, `/exit` to quit");
+    let (provider, model) = runner.current_model();
     println!("{LAVENDER}BACKBOARD CODING AGENT{RESET}");
     println!("{DIM}workspace: {}{RESET}", config.workspace_root.display());
+    println!("{DIM}model: {}/{model}{RESET}", provider);
+    println!("  {DIM}{command_hint}{RESET}\n");
+}
+
+fn handle_slash_command(
+    input: &str,
+    runner: &AgentRunner,
+    todos: &TodoStore,
+    model_catalog: &ModelCatalog,
+) -> bool {
+    let trimmed = input.trim();
+    if trimmed == "/" || trimmed.eq_ignore_ascii_case("/help") {
+        print_command_menu(runner, model_catalog);
+        return true;
+    }
+
+    if trimmed.eq_ignore_ascii_case("/clear") {
+        runner.clear_session();
+        todos.clear();
+        println!("  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}New thread started{RESET}");
+        println!();
+        return true;
+    }
+
+    if trimmed.starts_with("/model") {
+        handle_model_command(trimmed, runner, model_catalog);
+        return true;
+    }
+
+    false
+}
+
+fn print_command_menu(runner: &AgentRunner, model_catalog: &ModelCatalog) {
+    let (provider, model) = runner.current_model();
+    println!("{} {PRIMARY_TEXT}{BOLD}Commands{RESET}", badge("COMMANDS"));
+    println!("  {PRIMARY_TEXT}{BOLD}/help{RESET}      Show command list");
     println!(
-        "{DIM}model: {}/{}{RESET}",
-        config.llm_provider, config.model_name
+        "  {PRIMARY_TEXT}{BOLD}/clear{RESET}     Start a new thread (clears previous conversation)"
     );
-    println!("{DIM}type /exit to quit{RESET}\n");
+    println!("  {PRIMARY_TEXT}{BOLD}/model{RESET}     Open arrow-key dropdown model picker");
+    println!(
+        "  {PRIMARY_TEXT}{BOLD}/model p/m{RESET} Set provider/model, e.g. /model {}/{}",
+        provider, model
+    );
+    println!("  {PRIMARY_TEXT}{BOLD}TAB autocomplete{RESET} works while typing `/model <query>`");
+    println!();
+
+    if model_catalog.has_entries() {
+        println!(
+            "{} {PRIMARY_TEXT}{BOLD}Available models{RESET}",
+            badge("MODEL")
+        );
+        for entry in &model_catalog.providers {
+            let joined = entry.models.join(", ");
+            print_wrapped_line(
+                &format!("{}: {}", entry.provider, joined),
+                "  - ",
+                "    ",
+                false,
+            );
+        }
+        println!();
+    }
+}
+
+fn handle_model_command(input: &str, runner: &AgentRunner, model_catalog: &ModelCatalog) {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.len() == 1 {
+        let (provider, model) = runner.current_model();
+        match pick_model_with_arrows(model_catalog, &provider, &model) {
+            Ok(Some((selected_provider, selected_model))) => {
+                runner.set_model(selected_provider.clone(), selected_model.clone());
+                println!(
+                    "  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}Model set:{RESET} {}/{}",
+                    selected_provider, selected_model
+                );
+                println!();
+            }
+            Ok(None) => {
+                println!("  {DIM}model selection cancelled{RESET}\n");
+            }
+            Err(err) => {
+                println!(
+                    "  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}Model picker error:{RESET} {err}"
+                );
+                println!();
+            }
+        }
+        return;
+    }
+
+    let joined = tokens[1..].join(" ");
+    let parsed = parse_provider_model(&joined);
+    let Some((provider, model)) = parsed else {
+        println!(
+            "  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}Usage:{RESET} /model <provider>/<model>"
+        );
+        println!();
+        return;
+    };
+
+    if !model_catalog.contains(&provider, &model) {
+        println!(
+            "  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}Model not found in config/models.json:{RESET} {}/{}",
+            provider, model
+        );
+        println!();
+        return;
+    }
+
+    let provider_exact = model_catalog
+        .find_exact_provider(&provider)
+        .unwrap_or(provider.as_str())
+        .to_string();
+    let model_exact = model_catalog
+        .find_exact_model(&provider, &model)
+        .unwrap_or(model.as_str())
+        .to_string();
+
+    runner.set_model(provider_exact.clone(), model_exact.clone());
+    println!(
+        "  {LAVENDER}{BOLD}∴{RESET} {PRIMARY_TEXT}{BOLD}Model set:{RESET} {}/{}",
+        provider_exact, model_exact
+    );
+    println!();
+}
+
+fn parse_provider_model(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((provider, model)) = trimmed.split_once('/') {
+        let p = provider.trim();
+        let m = model.trim();
+        if !p.is_empty() && !m.is_empty() {
+            return Some((p.to_string(), m.to_string()));
+        }
+    }
+    None
 }
 
 fn print_event(event: &AgentEvent) {

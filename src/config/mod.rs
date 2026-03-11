@@ -12,6 +12,7 @@ pub struct Config {
     pub web_search_mode: String,
     pub workspace_root: PathBuf,
     pub prompts_dir: PathBuf,
+    pub model_catalog_path: PathBuf,
     pub request_timeout: Duration,
     pub command_timeout: Duration,
     pub max_iterations: usize,
@@ -31,6 +32,8 @@ impl Config {
         let cwd = env::current_dir().context("failed to read current directory")?;
         let workspace_root = env_path("AGENT_WORKSPACE_ROOT").unwrap_or(cwd.clone());
         let prompts_dir = env_path("AGENT_PROMPTS_DIR").unwrap_or(cwd.join("prompts"));
+        let model_catalog_path =
+            env_path("AGENT_MODEL_CATALOG_PATH").unwrap_or(cwd.join("config").join("models.json"));
 
         Ok(Self {
             backboard_api_key,
@@ -42,6 +45,7 @@ impl Config {
             web_search_mode: env_default("BACKBOARD_WEB_SEARCH_MODE", "off"),
             workspace_root,
             prompts_dir,
+            model_catalog_path,
             request_timeout: Duration::from_secs(env_u64("AGENT_HTTP_TIMEOUT_SECS", 120)),
             command_timeout: Duration::from_secs(env_u64("AGENT_COMMAND_TIMEOUT_SECS", 60)),
             max_iterations: env_usize("AGENT_MAX_ITERATIONS", 24),
