@@ -1,0 +1,5 @@
+Tool policy:
+- Prefer `ls`, `glob`, and `grep` for codebase exploration.
+- Use `read` with offsets for large files.
+- Use `execute` for validated commands only.
+- Keep outputs structured and deterministic.
