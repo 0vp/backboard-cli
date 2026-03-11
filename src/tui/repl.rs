@@ -104,7 +104,7 @@ pub async fn run_repl(
                 print_markdown_summary(&summary);
             }
             Err(err) => {
-                eprintln!("\x1b[31merror:{RESET} {err}");
+                eprintln!("\x1b[31merror:{RESET} {err:#}");
             }
         }
         println!();

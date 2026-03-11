@@ -24,6 +24,7 @@ pub struct AgentRunner {
     todos: TodoStore,
     sink: Arc<dyn EventSink>,
     session: Arc<Mutex<Option<AgentSession>>>,
+    assistant_id: Arc<Mutex<Option<String>>>,
     model_selection: Arc<Mutex<ModelSelection>>,
 }
 
@@ -52,6 +53,7 @@ impl AgentRunner {
             todos,
             sink,
             session: Arc::new(Mutex::new(None)),
+            assistant_id: Arc::new(Mutex::new(None)),
             model_selection: Arc::new(Mutex::new(ModelSelection {
                 provider: default_provider,
                 model: default_model,
@@ -229,28 +231,58 @@ impl AgentRunner {
             return Ok(existing);
         }
 
-        let assistant = self
-            .client
-            .create_assistant(CreateAssistantRequest {
-                name: "backboard-coding-agent".to_string(),
-                system_prompt: Some(self.prompts.coder_prompt().to_string()),
-                tools: self.tools.definitions(),
-            })
-            .await
-            .context("failed to create assistant")?;
+        let cached_assistant_id = {
+            self.assistant_id
+                .lock()
+                .expect("assistant_id mutex poisoned")
+                .clone()
+        };
+
+        let assistant_id = if let Some(existing) = cached_assistant_id {
+            existing
+        } else {
+            let assistant = self.create_assistant_with_retry().await?;
+            let assistant_id = assistant.assistant_id;
+            *self
+                .assistant_id
+                .lock()
+                .expect("assistant_id mutex poisoned") = Some(assistant_id.clone());
+            assistant_id
+        };
 
         let thread = self
-            .client
-            .create_thread(&assistant.assistant_id)
+            .create_thread_with_retry(&assistant_id)
             .await
             .context("failed to create thread")?;
 
         let session = AgentSession {
-            assistant_id: assistant.assistant_id,
+            assistant_id,
             thread_id: thread.thread_id,
         };
         *self.session.lock().expect("session mutex poisoned") = Some(session.clone());
         Ok(session)
+    }
+
+    async fn create_assistant_with_retry(&self) -> Result<crate::backboard::models::Assistant> {
+        retry_async(3, || {
+            self.client.create_assistant(CreateAssistantRequest {
+                name: "backboard-coding-agent".to_string(),
+                system_prompt: Some(self.prompts.coder_prompt().to_string()),
+                tools: self.tools.definitions(),
+            })
+        })
+        .await
+        .context("failed to create assistant")
+    }
+
+    async fn create_thread_with_retry(
+        &self,
+        assistant_id: &str,
+    ) -> Result<crate::backboard::models::Thread> {
+        let assistant_id = assistant_id.to_string();
+        retry_async(3, || self.client.create_thread(&assistant_id))
+            .await
+            .context("failed to create thread")
     }
 
     async fn add_message_with_retry(&self, request: AddMessageRequest) -> Result<MessageResponse> {
@@ -290,7 +322,8 @@ impl AgentRunner {
         *self.session.lock().expect("session mutex poisoned") = None;
         self.emit(
             EventKind::Status,
-            "conversation cleared; next prompt starts a new thread".to_string(),
+            "conversation cleared; next prompt starts a new thread on the same assistant"
+                .to_string(),
             None,
         );
     }
