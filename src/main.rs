@@ -9,6 +9,7 @@ use crate::agent::prompts::PromptStore;
 use crate::agent::runner::AgentRunner;
 use crate::backboard::client::BackboardClient;
 use crate::config::Config;
+use crate::runtime::logging::{LoggingEventSink, SessionLogger};
 use crate::runtime::models::ModelCatalog;
 use crate::runtime::todos::TodoStore;
 use crate::tools::registry::ToolRegistry;
@@ -40,7 +41,11 @@ async fn main() -> Result<()> {
 
     let tools = ToolRegistry::new();
     let todos = TodoStore::default();
-    let (sink, rx) = create_event_sink();
+    let logger = Arc::new(SessionLogger::new(&config.workspace_root)?);
+    let (channel_sink, rx) = create_event_sink();
+    let sink = Arc::new(LoggingEventSink::new(channel_sink, logger.clone()));
+
+    println!("log file: {}", logger.path().display());
 
     let runner = Arc::new(AgentRunner::new(
         backboard,
@@ -48,6 +53,7 @@ async fn main() -> Result<()> {
         prompts,
         tools,
         todos.clone(),
+        logger,
         sink,
     ));
 

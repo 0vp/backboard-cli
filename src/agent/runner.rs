@@ -7,6 +7,7 @@ use crate::backboard::models::{
     STATUS_COMPLETED, STATUS_FAILED, STATUS_REQUIRES_ACTION,
 };
 use crate::config::Config;
+use crate::runtime::logging::SessionLogger;
 use crate::runtime::todos::TodoStore;
 use crate::tools::registry::{ExecutionContext, ToolExecution, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +23,7 @@ pub struct AgentRunner {
     prompts: PromptStore,
     tools: ToolRegistry,
     todos: TodoStore,
+    logger: Arc<SessionLogger>,
     sink: Arc<dyn EventSink>,
     session: Arc<Mutex<Option<AgentSession>>>,
     assistant_id: Arc<Mutex<Option<String>>>,
@@ -41,6 +43,7 @@ impl AgentRunner {
         prompts: PromptStore,
         tools: ToolRegistry,
         todos: TodoStore,
+        logger: Arc<SessionLogger>,
         sink: Arc<dyn EventSink>,
     ) -> Self {
         let default_provider = config.llm_provider.clone();
@@ -51,6 +54,7 @@ impl AgentRunner {
             prompts,
             tools,
             todos,
+            logger,
             sink,
             session: Arc::new(Mutex::new(None)),
             assistant_id: Arc::new(Mutex::new(None)),
@@ -62,10 +66,28 @@ impl AgentRunner {
     }
 
     pub async fn run_prompt(&self, run_id: &str, prompt: &str) -> Result<String> {
+        self.log(
+            "run_prompt_start",
+            json!({
+                "run_id": run_id,
+                "prompt": prompt,
+                "prompt_chars": prompt.chars().count(),
+            }),
+        );
         let mut recovery_attempts = 0_usize;
         loop {
             match self.run_prompt_once(run_id, prompt).await {
-                Ok(summary) => return Ok(summary),
+                Ok(summary) => {
+                    self.log(
+                        "run_prompt_completed",
+                        json!({
+                            "run_id": run_id,
+                            "summary": &summary,
+                            "recovery_attempts": recovery_attempts,
+                        }),
+                    );
+                    return Ok(summary);
+                }
                 Err(err) if recovery_attempts < 3 && is_missing_tool_result_error(&err) => {
                     recovery_attempts += 1;
                     *self.session.lock().expect("session mutex poisoned") = None;
@@ -86,9 +108,13 @@ impl AgentRunner {
                             "reset_assistant": recovery_attempts >= 2,
                         })),
                     );
+                    self.log_error("run_prompt_recoverable_error", &err);
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    self.log_error("run_prompt_failed", &err);
+                    return Err(err);
+                }
             }
         }
     }
@@ -96,6 +122,16 @@ impl AgentRunner {
     async fn run_prompt_once(&self, run_id: &str, prompt: &str) -> Result<String> {
         let session = self.ensure_session().await?;
         let (provider, model) = self.current_model();
+        self.log(
+            "run_prompt_session",
+            json!({
+                "run_id": run_id,
+                "assistant_id": &session.assistant_id,
+                "thread_id": &session.thread_id,
+                "provider": &provider,
+                "model": &model,
+            }),
+        );
         self.emit(
             EventKind::Status,
             format!(
@@ -105,18 +141,39 @@ impl AgentRunner {
             Some(json!({ "run_id": run_id })),
         );
 
-        let mut response = self
-            .add_message_with_retry(AddMessageRequest {
-                thread_id: session.thread_id.clone(),
-                content: prompt.to_string(),
-                llm_provider: provider,
-                model_name: model,
-                memory: self.config.memory_mode.clone(),
-                web_search: self.config.web_search_mode.clone(),
-                stream: false,
-                send_to_llm: "true".to_string(),
-            })
-            .await?;
+        let add_message_request = AddMessageRequest {
+            thread_id: session.thread_id.clone(),
+            content: prompt.to_string(),
+            llm_provider: provider,
+            model_name: model,
+            memory: self.config.memory_mode.clone(),
+            web_search: self.config.web_search_mode.clone(),
+            stream: false,
+            send_to_llm: "true".to_string(),
+        };
+
+        self.log(
+            "add_message_request",
+            json!({
+                "thread_id": &add_message_request.thread_id,
+                "content": &add_message_request.content,
+                "llm_provider": &add_message_request.llm_provider,
+                "model_name": &add_message_request.model_name,
+                "memory": &add_message_request.memory,
+                "web_search": &add_message_request.web_search,
+                "stream": add_message_request.stream,
+                "send_to_llm": &add_message_request.send_to_llm,
+            }),
+        );
+
+        let mut response = match self.add_message_with_retry(add_message_request).await {
+            Ok(value) => value,
+            Err(err) => {
+                self.log_error("add_message_failed", &err);
+                return Err(err);
+            }
+        };
+        self.log("add_message_response", message_response_snapshot(&response));
 
         let mut finish_summary: Option<String> = None;
         for iteration in 1..=self.config.max_iterations {
@@ -135,14 +192,45 @@ impl AgentRunner {
                         return Err(anyhow!("REQUIRES_ACTION without tool calls"));
                     }
 
+                    self.log(
+                        "requires_action_tool_calls",
+                        json!({
+                            "run_id": &response.run_id,
+                            "status": &response.status,
+                            "tool_call_count": calls.len(),
+                            "tool_call_ids": calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+                        }),
+                    );
+
                     let outputs = self.execute_tools(calls, &mut finish_summary).await?;
                     let run_id = response
                         .run_id
                         .clone()
                         .context("missing run_id in REQUIRES_ACTION response")?;
-                    response = self
+                    self.log(
+                        "submit_tool_outputs_request",
+                        json!({
+                            "thread_id": &session.thread_id,
+                            "run_id": &run_id,
+                            "tool_output_count": outputs.len(),
+                            "tool_outputs": outputs_snapshot(&outputs),
+                        }),
+                    );
+
+                    response = match self
                         .submit_tool_outputs_with_retry(&session.thread_id, &run_id, outputs)
-                        .await?;
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            self.log_error("submit_tool_outputs_failed", &err);
+                            return Err(err);
+                        }
+                    };
+                    self.log(
+                        "submit_tool_outputs_response",
+                        message_response_snapshot(&response),
+                    );
                 }
                 STATUS_COMPLETED => {
                     return Ok(first_non_empty(
@@ -152,6 +240,15 @@ impl AgentRunner {
                     ));
                 }
                 STATUS_FAILED | STATUS_CANCELLED => {
+                    self.log(
+                        "run_failed_status",
+                        json!({
+                            "status": &status,
+                            "content": &response.content,
+                            "message": &response.message,
+                            "run_id": &response.run_id,
+                        }),
+                    );
                     if finish_summary.is_some() {
                         return Ok(first_non_empty(
                             finish_summary.clone(),
@@ -249,6 +346,15 @@ impl AgentRunner {
 
         let mut gathered: Vec<(usize, ToolExecution)> = Vec::new();
         while let Some((idx, call, mut outcome)) = tasks.next().await {
+            let raw_output = outcome.output.output.clone();
+            self.log(
+                "tool_execution_result_raw",
+                json!({
+                    "tool": &call.function.name,
+                    "tool_call_id": &call.id,
+                    "raw_output": raw_output,
+                }),
+            );
             outcome.output.output = compact_tool_output(&outcome.output.output, 8_000);
             let ok = parse_ok(&outcome.output.output);
             self.emit(
@@ -394,6 +500,14 @@ impl AgentRunner {
         });
     }
 
+    fn log(&self, event: &str, payload: Value) {
+        self.logger.log(event, payload);
+    }
+
+    fn log_error(&self, event: &str, err: &anyhow::Error) {
+        self.logger.log_error(event, err);
+    }
+
     pub fn clear_session(&self) {
         *self.session.lock().expect("session mutex poisoned") = None;
         self.emit(
@@ -521,6 +635,46 @@ fn extract_error_code(output: &str) -> Option<u16> {
         .get("error")
         .and_then(Value::as_str)
         .and_then(parse_status_code_from_text)
+}
+
+fn outputs_snapshot(outputs: &[crate::backboard::models::ToolOutput]) -> Value {
+    Value::Array(
+        outputs
+            .iter()
+            .map(|item| {
+                json!({
+                    "tool_call_id": &item.tool_call_id,
+                    "output": &item.output,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn message_response_snapshot(response: &MessageResponse) -> Value {
+    let tool_calls = response.tool_calls.as_ref().map(|calls| {
+        calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": &call.id,
+                    "function": {
+                        "name": &call.function.name,
+                        "arguments": &call.function.arguments,
+                        "parsed_arguments": &call.function.parsed_arguments,
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    json!({
+        "status": &response.status,
+        "run_id": &response.run_id,
+        "message": &response.message,
+        "content": &response.content,
+        "tool_calls": tool_calls,
+    })
 }
 
 fn parse_status_code_from_text(input: &str) -> Option<u16> {
