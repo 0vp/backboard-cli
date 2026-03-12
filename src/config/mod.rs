@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use std::{env, path::PathBuf, time::Duration};
+use serde::Deserialize;
+use std::{env, path::Path, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -23,15 +24,19 @@ impl Config {
     pub fn load() -> Result<Self> {
         let _ = dotenvy::dotenv();
 
-        let backboard_api_key = must_env("BACKBOARD_API_KEY")?;
-        let jina_api_key = env::var("JINA_API_KEY")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
         let cwd = env::current_dir().context("failed to read current directory")?;
-        let workspace_root = env_path("AGENT_WORKSPACE_ROOT").unwrap_or(cwd.clone());
         let prompts_dir = env_path("AGENT_PROMPTS_DIR").unwrap_or(cwd.join("prompts"));
+        let file_config_path = resolve_file_config_path(&cwd, &prompts_dir);
+        let file_config = load_file_config(file_config_path.as_deref())?;
+
+        let backboard_api_key = must_env_or_file(
+            "BACKBOARD_API_KEY",
+            file_config.backboard_api_key,
+            file_config_path.as_deref(),
+        )?;
+        let jina_api_key = env_or_file_optional("JINA_API_KEY", file_config.jina_api_key);
+
+        let workspace_root = env_path("AGENT_WORKSPACE_ROOT").unwrap_or(cwd.clone());
         let model_catalog_path =
             env_path("AGENT_MODEL_CATALOG_PATH").unwrap_or(cwd.join("config").join("models.json"));
 
@@ -54,13 +59,46 @@ impl Config {
     }
 }
 
-fn must_env(key: &str) -> Result<String> {
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileConfig {
+    backboard_api_key: Option<String>,
+    jina_api_key: Option<String>,
+}
+
+fn must_env_or_file(
+    key: &str,
+    file_value: Option<String>,
+    config_path: Option<&Path>,
+) -> Result<String> {
     let v = env::var(key).unwrap_or_default();
     let trimmed = v.trim();
     if trimmed.is_empty() {
-        bail!("missing required env var {key}")
+        if let Some(value) = file_value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Ok(value);
+        }
+
+        let location_hint = config_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "config/local.json or ~/.config/wuvo/config.json".to_string());
+
+        bail!("missing required env var {key} and no {key} in {location_hint}")
     }
     Ok(trimmed.to_string())
+}
+
+fn env_or_file_optional(key: &str, file_value: Option<String>) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            file_value
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
 }
 
 fn env_default(key: &str, fallback: &str) -> String {
@@ -95,6 +133,47 @@ fn env_path(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn resolve_file_config_path(cwd: &Path, prompts_dir: &Path) -> Option<PathBuf> {
+    if let Some(explicit) = env_path("AGENT_CONFIG_PATH") {
+        return Some(explicit);
+    }
+
+    let agent_root = prompts_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf());
+
+    [
+        agent_root.join("config").join("local.json"),
+        cwd.join("config").join("local.json"),
+        home_dir().join(".config").join("wuvo").join("config.json"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
+fn load_file_config(path: Option<&Path>) -> Result<FileConfig> {
+    let Some(path) = path else {
+        return Ok(FileConfig::default());
+    };
+
+    if !path.exists() {
+        return Ok(FileConfig::default());
+    }
+
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in config file {}", path.display()))
+}
+
+fn home_dir() -> PathBuf {
+    env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn env_allowlist(key: &str) -> Vec<String> {
     if let Ok(raw) = env::var(key) {
         let list: Vec<String> = raw
@@ -108,9 +187,9 @@ fn env_allowlist(key: &str) -> Vec<String> {
     }
 
     [
-        "ls", "pwd", "which", "echo", "cat", "head", "tail", "wc", "rg", "tree", "find", "date",
-        "uname", "whoami", "python", "python3", "pip", "pip3", "node", "npm", "npx", "pnpm",
-        "yarn", "bun", "cargo", "rustc", "git", "go",
+        "ls", "mkdir", "touch", "pwd", "which", "echo", "cat", "head", "tail", "wc", "rg", "tree",
+        "find", "date", "uname", "whoami", "python", "python3", "pip", "pip3", "node", "npm",
+        "npx", "pnpm", "yarn", "bun", "cargo", "rustc", "git", "go",
     ]
     .into_iter()
     .map(str::to_string)
