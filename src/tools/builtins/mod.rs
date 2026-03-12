@@ -36,6 +36,31 @@ pub fn specs() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
+            name: "create".to_string(),
+            description: "Create file with content".to_string(),
+            parameters: schema(
+                json!({
+                    "path": { "type": "string", "description": "Absolute or workspace-relative file path" },
+                    "content": { "type": "string", "description": "File content", "default": "" },
+                    "overwrite": { "type": "boolean", "description": "Overwrite if file exists", "default": false }
+                }),
+                &["path"],
+            ),
+        },
+        ToolSpec {
+            name: "edit".to_string(),
+            description: "Edit file by replacing text".to_string(),
+            parameters: schema(
+                json!({
+                    "path": { "type": "string", "description": "Absolute or workspace-relative file path" },
+                    "old_text": { "type": "string", "description": "Text to replace" },
+                    "new_text": { "type": "string", "description": "Replacement text" },
+                    "replace_all": { "type": "boolean", "description": "Replace all occurrences", "default": false }
+                }),
+                &["path", "old_text", "new_text"],
+            ),
+        },
+        ToolSpec {
             name: "glob".to_string(),
             description: "Find files by glob pattern".to_string(),
             parameters: schema(
@@ -96,17 +121,26 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "todo_create".to_string(),
             description: "Create todo item".to_string(),
-            parameters: schema(json!({ "title": { "type": "string" } }), &["title"]),
+            parameters: schema(
+                json!({
+                    "title": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "default": "pending" },
+                    "priority": { "type": "string", "enum": ["low", "medium", "high"] }
+                }),
+                &["title"],
+            ),
         },
         ToolSpec {
             name: "todo_update".to_string(),
-            description: "Update todo title".to_string(),
+            description: "Update todo title/status/priority".to_string(),
             parameters: schema(
                 json!({
                     "id": { "type": "string" },
-                    "title": { "type": "string" }
+                    "title": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
+                    "priority": { "type": "string", "enum": ["low", "medium", "high"] }
                 }),
-                &["id", "title"],
+                &["id"],
             ),
         },
         ToolSpec {
@@ -136,6 +170,8 @@ pub async fn dispatch(name: &str, args: Value, ctx: &mut ExecutionContext) -> Re
     match name {
         "read" => file_ops::read(args, ctx).await,
         "ls" => file_ops::ls(args, ctx).await,
+        "create" => file_ops::create(args, ctx).await,
+        "edit" => file_ops::edit(args, ctx).await,
         "glob" => search_ops::glob(args, ctx).await,
         "grep" => search_ops::grep(args, ctx).await,
         "execute" => command_ops::execute(args, ctx).await,

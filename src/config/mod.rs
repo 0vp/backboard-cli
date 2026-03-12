@@ -108,8 +108,9 @@ fn env_allowlist(key: &str) -> Vec<String> {
     }
 
     [
-        "ls", "pwd", "rg", "cat", "head", "tail", "wc", "echo", "python", "python3", "node", "npm",
-        "cargo", "rustc", "git", "go",
+        "ls", "pwd", "which", "echo", "cat", "head", "tail", "wc", "rg", "tree", "find", "date",
+        "uname", "whoami", "python", "python3", "pip", "pip3", "node", "npm", "npx", "pnpm",
+        "yarn", "bun", "cargo", "rustc", "git", "go",
     ]
     .into_iter()
     .map(str::to_string)

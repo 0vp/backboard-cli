@@ -2,7 +2,7 @@ use crate::agent::events::{AgentEvent, EventKind, EventSink};
 use crate::agent::runner::AgentRunner;
 use crate::config::Config;
 use crate::runtime::models::ModelCatalog;
-use crate::runtime::todos::TodoStore;
+use crate::runtime::todos::{TodoStatus, TodoStore};
 use crate::tui::input::{pick_model_with_arrows, ReplHelper};
 use anyhow::Result;
 use chrono::Utc;
@@ -314,18 +314,36 @@ fn print_todos(todos: &TodoStore) {
 
     println!("{} {}", badge("TODO"), format_inline_markdown("Items"));
     for item in items {
+        let status = item.status.as_str();
+        let priority = item
+            .priority
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| "none".to_string());
         if item.completed {
             println!(
-                "  • {STRIKE}{}{RESET}{DIM} ({}){RESET}",
+                "  • {STRIKE}{}{RESET}{DIM} ({}, priority={}, {}){RESET}",
                 format_inline_markdown(&item.title),
+                status,
+                priority,
                 short_uuid(&item.id)
             );
         } else {
-            println!(
-                "  • {PRIMARY_TEXT}{BOLD}{}{RESET}{DIM} ({}){RESET}",
-                format_inline_markdown(&item.title),
-                short_uuid(&item.id)
-            );
+            match item.status {
+                TodoStatus::InProgress => println!(
+                    "  • {LAVENDER}{BOLD}{}{RESET}{DIM} ({}, priority={}, {}){RESET}",
+                    format_inline_markdown(&item.title),
+                    status,
+                    priority,
+                    short_uuid(&item.id)
+                ),
+                _ => println!(
+                    "  • {PRIMARY_TEXT}{BOLD}{}{RESET}{DIM} ({}, priority={}, {}){RESET}",
+                    format_inline_markdown(&item.title),
+                    status,
+                    priority,
+                    short_uuid(&item.id)
+                ),
+            }
         }
     }
     println!();

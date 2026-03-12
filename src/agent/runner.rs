@@ -541,10 +541,15 @@ fn normalize_status(value: Option<&str>) -> String {
 }
 
 fn parse_ok(output: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(output)
-        .ok()
-        .and_then(|v| v.get("ok").and_then(|v| v.as_bool()))
-        .unwrap_or(false)
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return false;
+    };
+
+    if let Some(ok) = value.get("ok").and_then(Value::as_bool) {
+        return ok;
+    }
+
+    value.get("error").is_none()
 }
 
 fn first_non_empty(a: Option<String>, b: Option<String>, c: Option<String>) -> String {
@@ -603,10 +608,7 @@ fn compact_tool_output(raw: &str, max_chars: usize) -> String {
 
     let preview_len = max_chars.saturating_sub(220).max(200);
     let preview: String = raw.chars().take(preview_len).collect();
-    let parsed_ok = serde_json::from_str::<Value>(raw)
-        .ok()
-        .and_then(|v| v.get("ok").and_then(Value::as_bool))
-        .unwrap_or(false);
+    let parsed_ok = parse_ok(raw);
 
     json!({
         "ok": parsed_ok,
@@ -619,8 +621,16 @@ fn compact_tool_output(raw: &str, max_chars: usize) -> String {
 
 fn extract_error_code(output: &str) -> Option<u16> {
     let parsed = serde_json::from_str::<Value>(output).ok()?;
-    if parsed.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+    if parsed.get("ok").and_then(Value::as_bool).unwrap_or(true) {
         return None;
+    }
+
+    if let Some(code) = parsed
+        .pointer("/status_code")
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+    {
+        return Some(code);
     }
 
     if let Some(code) = parsed

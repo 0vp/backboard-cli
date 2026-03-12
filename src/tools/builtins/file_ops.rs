@@ -1,6 +1,8 @@
-use crate::tools::builtins::utils::{get_optional_usize, get_usize, paginate, resolve_path};
+use crate::tools::builtins::utils::{
+    get_bool, get_optional_usize, get_usize, paginate, resolve_path, resolve_path_for_create,
+};
 use crate::tools::registry::ExecutionContext;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub async fn read(args: Value, ctx: &ExecutionContext) -> Result<Value> {
@@ -62,9 +64,89 @@ pub async fn ls(args: Value, ctx: &ExecutionContext) -> Result<Value> {
     }))
 }
 
+pub async fn create(args: Value, ctx: &ExecutionContext) -> Result<Value> {
+    let path_arg = args
+        .get("path")
+        .and_then(Value::as_str)
+        .context("path is required")?;
+    let path = resolve_path_for_create(&ctx.workspace_root, Some(path_arg))?;
+
+    let overwrite = get_bool(&args, "overwrite", false);
+    if path.exists() && !overwrite {
+        bail!(
+            "file already exists: {} (set overwrite=true to replace)",
+            path.display()
+        );
+    }
+
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    tokio::fs::write(&path, &content)
+        .await
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "bytes_written": content.len(),
+        "overwritten": overwrite
+    }))
+}
+
+pub async fn edit(args: Value, ctx: &ExecutionContext) -> Result<Value> {
+    let path_arg = args
+        .get("path")
+        .and_then(Value::as_str)
+        .context("path is required")?;
+    let path = resolve_path(&ctx.workspace_root, Some(path_arg))?;
+
+    let old_text = args
+        .get("old_text")
+        .and_then(Value::as_str)
+        .context("old_text is required")?;
+    if old_text.is_empty() {
+        bail!("old_text cannot be empty");
+    }
+
+    let new_text = args
+        .get("new_text")
+        .and_then(Value::as_str)
+        .context("new_text is required")?;
+    let replace_all = get_bool(&args, "replace_all", false);
+
+    let source = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+
+    let occurrences = source.matches(old_text).count();
+    if occurrences == 0 {
+        bail!("old_text not found in {}", path.display());
+    }
+
+    let updated = if replace_all {
+        source.replace(old_text, new_text)
+    } else {
+        source.replacen(old_text, new_text, 1)
+    };
+
+    tokio::fs::write(&path, updated)
+        .await
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "occurrences_found": occurrences,
+        "occurrences_replaced": if replace_all { occurrences } else { 1 },
+        "replace_all": replace_all
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::read;
+    use super::{create, edit, read};
     use crate::agent::events::{AgentEvent, EventSink};
     use crate::runtime::todos::TodoStore;
     use crate::tools::registry::ExecutionContext;
@@ -101,5 +183,40 @@ mod tests {
         .expect("read result");
         assert_eq!(result["content"], "cd");
         assert_eq!(result["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn create_and_edit_file() {
+        let dir = tempdir().expect("tempdir");
+
+        let ctx = ExecutionContext {
+            workspace_root: dir.path().to_path_buf(),
+            command_timeout: Duration::from_secs(1),
+            jina_api_key: None,
+            execute_allowlist: vec![],
+            todo_store: TodoStore::default(),
+            event_sink: Arc::new(NoopSink),
+        };
+
+        let create_out = create(
+            json!({"path":"note.txt", "content":"hello world", "overwrite": false}),
+            &ctx,
+        )
+        .await
+        .expect("create result");
+        assert_eq!(create_out["bytes_written"], 11);
+
+        let edit_out = edit(
+            json!({"path":"note.txt", "old_text":"hello", "new_text":"hi", "replace_all": false}),
+            &ctx,
+        )
+        .await
+        .expect("edit result");
+        assert_eq!(edit_out["occurrences_replaced"], 1);
+
+        let final_text = tokio::fs::read_to_string(dir.path().join("note.txt"))
+            .await
+            .expect("read file");
+        assert_eq!(final_text, "hi world");
     }
 }

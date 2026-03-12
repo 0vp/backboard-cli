@@ -93,7 +93,7 @@ impl ToolRegistry {
             return ToolExecution {
                 output: ToolOutput {
                     tool_call_id: call.id.clone(),
-                    output: json!({ "ok": true }).to_string(),
+                    output: json!({ "ok": true, "keep_alive": true }).to_string(),
                 },
                 is_finish: false,
                 finish_summary: None,
@@ -103,7 +103,7 @@ impl ToolRegistry {
         ToolExecution {
             output: ToolOutput {
                 tool_call_id: call.id.clone(),
-                output: json!({ "ok": true, "result": result }).to_string(),
+                output: result.to_string(),
             },
             is_finish: false,
             finish_summary: None,
@@ -169,7 +169,7 @@ mod tests {
         let result = registry.execute(&call, ctx).await;
         let output: serde_json::Value =
             serde_json::from_str(&result.output.output).expect("valid json");
-        assert_eq!(output, json!({ "ok": true }));
+        assert_eq!(output, json!({ "ok": true, "keep_alive": true }));
         assert!(!result.is_finish);
     }
 }

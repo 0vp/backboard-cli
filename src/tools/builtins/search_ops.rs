@@ -1,11 +1,9 @@
 use crate::tools::builtins::utils::{get_optional_usize, get_usize, paginate, resolve_path};
 use crate::tools::registry::ExecutionContext;
-use anyhow::{Context, Result};
-use regex::Regex;
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use walkdir::WalkDir;
+use tokio::process::Command;
+use tokio::time::timeout;
 
 const MAX_SCAN_MATCHES: usize = 2_000;
 
@@ -57,38 +55,78 @@ pub async fn grep(args: Value, ctx: &ExecutionContext) -> Result<Value> {
         .filter(|v| !v.is_empty())
         .context("pattern is required")?;
 
-    let regex = Regex::new(pattern).with_context(|| format!("invalid regex pattern: {pattern}"))?;
     let base_arg = args.get("path").and_then(Value::as_str);
     let base_path = resolve_path(&ctx.workspace_root, base_arg)?;
 
+    let output = timeout(
+        ctx.command_timeout,
+        Command::new("rg")
+            .arg("--json")
+            .arg("-n")
+            .arg("--glob")
+            .arg("!.git/**")
+            .arg("--glob")
+            .arg("!node_modules/**")
+            .arg("--glob")
+            .arg("!target/**")
+            .arg("--glob")
+            .arg("!.factory/**")
+            .arg("--")
+            .arg(pattern)
+            .arg(base_path.as_os_str())
+            .current_dir(&ctx.workspace_root)
+            .output(),
+    )
+    .await;
+
+    let output = match output {
+        Ok(result) => result.context("failed to execute rg")?,
+        Err(_) => {
+            bail!(
+                "grep command timed out after {}s",
+                ctx.command_timeout.as_secs()
+            )
+        }
+    };
+
+    let status = output.status.code().unwrap_or(-1);
+    if status != 0 && status != 1 {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        bail!("rg failed (exit {status}): {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut matches = Vec::<Value>::new();
-    for entry in WalkDir::new(&base_path).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        if should_skip(path) || !entry.file_type().is_file() {
+    for raw in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+
+        if event.get("type").and_then(Value::as_str) != Some("match") {
             continue;
         }
 
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => continue,
-        };
-        let reader = BufReader::new(file);
-        for (idx, line_result) in reader.lines().enumerate() {
-            let line = match line_result {
-                Ok(line) => line,
-                Err(_) => continue,
-            };
-            if regex.is_match(&line) {
-                matches.push(json!({
-                    "path": path.display().to_string(),
-                    "line": idx + 1,
-                    "content": line
-                }));
-                if matches.len() >= MAX_SCAN_MATCHES {
-                    break;
-                }
-            }
-        }
+        let path = event
+            .pointer("/data/path/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let line_number = event
+            .pointer("/data/line_number")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let content = event
+            .pointer("/data/lines/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches('\n')
+            .to_string();
+
+        matches.push(json!({
+            "path": path,
+            "line": line_number,
+            "content": content
+        }));
 
         if matches.len() >= MAX_SCAN_MATCHES {
             break;
@@ -101,6 +139,7 @@ pub async fn grep(args: Value, ctx: &ExecutionContext) -> Result<Value> {
 
     Ok(json!({
         "pattern": pattern,
+        "path": base_path.display().to_string(),
         "offset": offset,
         "limit": limit,
         "total_matches": matches.len(),
@@ -108,13 +147,4 @@ pub async fn grep(args: Value, ctx: &ExecutionContext) -> Result<Value> {
         "has_more": has_more,
         "matches": paged
     }))
-}
-
-fn should_skip(path: &std::path::Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component.as_os_str().to_string_lossy().as_ref(),
-            ".git" | "node_modules" | "target" | ".factory"
-        )
-    })
 }
