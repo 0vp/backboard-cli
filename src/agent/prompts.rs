@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::env;
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -29,7 +30,23 @@ impl PromptStore {
 
 fn with_runtime_vars(raw: &str) -> String {
     let today = Utc::now().format("%Y-%m-%d").to_string();
+    let workspace_root = resolve_workspace_root();
+
     raw.replace("{{TODAY_DATE}}", &today)
+        .replace("{{WORKSPACE_ROOT}}", &workspace_root)
+}
+
+fn resolve_workspace_root() -> String {
+    env::var("AGENT_WORKSPACE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        })
+        .unwrap_or_else(|| ".".to_string())
 }
 
 #[cfg(test)]
@@ -41,5 +58,13 @@ mod tests {
         let out = with_runtime_vars("Date={{TODAY_DATE}}");
         assert!(!out.contains("{{TODAY_DATE}}"));
         assert!(out.starts_with("Date="));
+    }
+
+    #[test]
+    fn replaces_workspace_root_placeholder() {
+        let out = with_runtime_vars("Workspace={{WORKSPACE_ROOT}}");
+        assert!(!out.contains("{{WORKSPACE_ROOT}}"));
+        assert!(out.starts_with("Workspace="));
+        assert!(out.len() > "Workspace=".len());
     }
 }

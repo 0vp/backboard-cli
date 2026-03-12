@@ -210,7 +210,7 @@ You are given the following information about the user's system and environment:
 You are working in a remote environment with filesystem access. Your file operations should only be scoped to `fileSystem` repository locations.
 Your current working directory is set to: `/project/workspace`
 
-The repository `` is available within the path: `/project/workspace/undefined`.
+The repository `` is available within the path: `{{WORKSPACE_ROOT}}`.
 Before viewing any files or creating a feature branch, pull the latest changes from the remote repository. If CLI access to pull the changes is unavailable, proceed with file inspection using available tools and note the limitation briefly.
 </Droid_Environment>
 
