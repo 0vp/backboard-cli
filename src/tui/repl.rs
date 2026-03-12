@@ -6,13 +6,18 @@ use crate::runtime::todos::TodoStore;
 use crate::tui::input::{pick_model_with_arrows, ReplHelper};
 use anyhow::Result;
 use chrono::Utc;
+use crossterm::cursor::MoveUp;
+use crossterm::execute;
+use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::cmp::max;
+use std::collections::HashMap;
 use std::env;
+use std::io::{stdout, Write};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -25,6 +30,7 @@ const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
 const STRIKE: &str = "\x1b[9m";
+const ERROR_TEXT: &str = "\x1b[38;2;255;138;150m";
 
 pub struct ChannelEventSink {
     tx: UnboundedSender<AgentEvent>,
@@ -52,7 +58,13 @@ pub async fn run_repl(
 
     let todo_store = todos.clone();
     let printer = tokio::spawn(async move {
+        let mut tool_board = ToolEventBoard::default();
         while let Some(event) = rx.recv().await {
+            if tool_board.handle_tool_event(&event) {
+                tool_board.render();
+                continue;
+            }
+            tool_board.detach();
             print_event(&event);
             if should_render_todos(&event) {
                 print_todos(&todo_store);
@@ -429,6 +441,213 @@ fn event_label(event: &AgentEvent) -> Cow<'_, str> {
                 .unwrap_or("TOOL");
             Cow::Owned(tool.replace('_', " ").to_uppercase())
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ToolDisplayState {
+    Pending,
+    Running,
+    Done,
+}
+
+#[derive(Clone, Debug)]
+struct ToolDisplayEntry {
+    tool: String,
+    args: String,
+    state: ToolDisplayState,
+    response: Option<String>,
+    is_error: bool,
+}
+
+#[derive(Default)]
+struct ToolEventBoard {
+    ordered_ids: Vec<String>,
+    by_id: HashMap<String, ToolDisplayEntry>,
+    rendered_lines: usize,
+}
+
+impl ToolEventBoard {
+    fn handle_tool_event(&mut self, event: &AgentEvent) -> bool {
+        if !matches!(
+            event.kind,
+            EventKind::ToolQueued | EventKind::ToolRunning | EventKind::ToolResult
+        ) {
+            return false;
+        }
+
+        let Some(meta) = event.metadata.as_ref() else {
+            return false;
+        };
+
+        let call_id = meta
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if call_id.is_empty() {
+            return false;
+        }
+
+        let tool = meta
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        let args = meta
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}")
+            .to_string();
+        let args_for_insert = args.clone();
+
+        let entry = self.by_id.entry(call_id.clone()).or_insert_with(|| {
+            self.ordered_ids.push(call_id.clone());
+            ToolDisplayEntry {
+                tool,
+                args: args_for_insert,
+                state: ToolDisplayState::Pending,
+                response: None,
+                is_error: false,
+            }
+        });
+
+        if entry.args == "{}" && args != "{}" {
+            entry.args = args;
+        }
+
+        match event.kind {
+            EventKind::ToolQueued => {
+                entry.state = ToolDisplayState::Pending;
+            }
+            EventKind::ToolRunning => {
+                entry.state = ToolDisplayState::Running;
+            }
+            EventKind::ToolResult => {
+                entry.state = ToolDisplayState::Done;
+                let output = meta
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&event.message);
+                let is_error = !meta.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let error_code = meta.get("error_code").and_then(Value::as_u64);
+                entry.is_error = is_error;
+                entry.response = Some(format_tool_response_line(output, is_error, error_code));
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    fn render(&mut self) {
+        let lines = self.render_lines();
+        if lines.is_empty() {
+            return;
+        }
+
+        let mut out = stdout();
+        if self.rendered_lines > 0 {
+            let _ = execute!(out, MoveUp(self.rendered_lines as u16));
+        }
+
+        let total = self.rendered_lines.max(lines.len());
+        for index in 0..total {
+            let _ = execute!(out, Clear(ClearType::CurrentLine));
+            if let Some(line) = lines.get(index) {
+                let _ = writeln!(out, "{line}");
+            } else {
+                let _ = writeln!(out);
+            }
+        }
+
+        if self.rendered_lines > lines.len() {
+            let _ = execute!(out, MoveUp((self.rendered_lines - lines.len()) as u16));
+        }
+
+        let _ = out.flush();
+        self.rendered_lines = lines.len();
+    }
+
+    fn detach(&mut self) {
+        self.rendered_lines = 0;
+        if self.by_id.len() > 48 {
+            self.ordered_ids.clear();
+            self.by_id.clear();
+        }
+    }
+
+    fn render_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for id in &self.ordered_ids {
+            if let Some(entry) = self.by_id.get(id) {
+                let label = entry.tool.replace('_', " ").to_uppercase();
+                let args = compact_message(&entry.args);
+                lines.push(format!(
+                    "  {} {PRIMARY_TEXT}{BOLD}({}){RESET}",
+                    badge(&label),
+                    truncate_for_tool_panel(&args, terminal_width().saturating_sub(18).max(32)),
+                ));
+
+                let status_text = match entry.state {
+                    ToolDisplayState::Pending => format!("{DIM}↳ Pending{RESET}"),
+                    ToolDisplayState::Running => format!("{DIM}↳ Running{RESET}"),
+                    ToolDisplayState::Done => {
+                        let response = entry.response.as_deref().unwrap_or("↳ Done");
+                        if entry.is_error {
+                            format!("{ERROR_TEXT}{BOLD}{response}{RESET}")
+                        } else {
+                            format!("{DIM}{response}{RESET}")
+                        }
+                    }
+                };
+                lines.push(format!("  {status_text}"));
+                lines.push(String::new());
+            }
+        }
+        lines
+    }
+}
+
+fn format_tool_response_line(output: &str, is_error: bool, error_code: Option<u64>) -> String {
+    let compact = compact_message(output);
+    if is_error {
+        let code = error_code
+            .map(|v| v.to_string())
+            .or_else(|| parse_error_code_from_text(&compact).map(|v| v.to_string()));
+        if let Some(code) = code {
+            return format!(
+                "↳ Error ({code}): {}",
+                truncate_for_tool_panel(&compact, 220)
+            );
+        }
+        return format!("↳ Error: {}", truncate_for_tool_panel(&compact, 220));
+    }
+
+    format!("↳ Response: {}", truncate_for_tool_panel(&compact, 220))
+}
+
+fn parse_error_code_from_text(text: &str) -> Option<u16> {
+    let bytes = text.as_bytes();
+    for window in bytes.windows(3) {
+        if window.iter().all(u8::is_ascii_digit) && (window[0] == b'4' || window[0] == b'5') {
+            if let Ok(raw) = std::str::from_utf8(window) {
+                if let Ok(code) = raw.parse::<u16>() {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn truncate_for_tool_panel(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{out}...")
+    } else {
+        out
     }
 }
 

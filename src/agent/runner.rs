@@ -12,7 +12,7 @@ use crate::tools::registry::{ExecutionContext, ToolExecution, ToolRegistry};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 
@@ -62,6 +62,38 @@ impl AgentRunner {
     }
 
     pub async fn run_prompt(&self, run_id: &str, prompt: &str) -> Result<String> {
+        let mut recovery_attempts = 0_usize;
+        loop {
+            match self.run_prompt_once(run_id, prompt).await {
+                Ok(summary) => return Ok(summary),
+                Err(err) if recovery_attempts < 3 && is_missing_tool_result_error(&err) => {
+                    recovery_attempts += 1;
+                    *self.session.lock().expect("session mutex poisoned") = None;
+                    if recovery_attempts >= 2 {
+                        *self
+                            .assistant_id
+                            .lock()
+                            .expect("assistant_id mutex poisoned") = None;
+                    }
+                    self.emit(
+                        EventKind::Status,
+                        "detected tool-call mismatch; retrying prompt on a fresh session"
+                            .to_string(),
+                        Some(json!({
+                            "run_id": run_id,
+                            "recovery": "thread_reset",
+                            "attempt": recovery_attempts,
+                            "reset_assistant": recovery_attempts >= 2,
+                        })),
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn run_prompt_once(&self, run_id: &str, prompt: &str) -> Result<String> {
         let session = self.ensure_session().await?;
         let (provider, model) = self.current_model();
         self.emit(
@@ -134,7 +166,8 @@ impl AgentRunner {
                     ));
                 }
                 _ => {
-                    if response.tool_calls.as_ref().is_none_or(|v| v.is_empty())
+                    if status.is_empty()
+                        && response.tool_calls.as_ref().is_none_or(|v| v.is_empty())
                         && !content.trim().is_empty()
                     {
                         return Ok(first_non_empty(
@@ -161,13 +194,28 @@ impl AgentRunner {
     ) -> Result<Vec<crate::backboard::models::ToolOutput>> {
         let mut tasks = FuturesUnordered::new();
         let total = calls.len();
+        let mut expected_call_ids: Vec<String> = Vec::with_capacity(total);
 
         for (index, call) in calls.into_iter().enumerate() {
             self.tools.ensure_allowed(&call.function.name)?;
+            let arguments = tool_arguments_preview(&call);
+            expected_call_ids.push(call.id.clone());
             self.emit(
                 EventKind::ToolQueued,
-                format!("queued tool {}/{}: {}", index + 1, total, call.function.name),
-                Some(json!({ "tool": call.function.name, "tool_call_id": call.id, "state": "queued" })),
+                format!(
+                    "queued tool {}/{}: {}",
+                    index + 1,
+                    total,
+                    call.function.name
+                ),
+                Some(json!({
+                    "tool": call.function.name,
+                    "tool_call_id": call.id,
+                    "tool_index": index + 1,
+                    "tool_total": total,
+                    "arguments": arguments,
+                    "state": "queued"
+                })),
             );
 
             let call_clone = call.clone();
@@ -187,7 +235,12 @@ impl AgentRunner {
                     kind: EventKind::ToolRunning,
                     message: format!("running tool: {}", call_clone.function.name),
                     timestamp: Utc::now(),
-                    metadata: Some(json!({ "tool": call_clone.function.name, "tool_call_id": call_clone.id, "state": "running" })),
+                    metadata: Some(json!({
+                        "tool": call_clone.function.name,
+                        "tool_call_id": call_clone.id,
+                        "arguments": tool_arguments_preview(&call_clone),
+                        "state": "running"
+                    })),
                 });
                 let result = tools.execute(&call_clone, ctx).await;
                 (index, call_clone, result)
@@ -195,7 +248,8 @@ impl AgentRunner {
         }
 
         let mut gathered: Vec<(usize, ToolExecution)> = Vec::new();
-        while let Some((idx, call, outcome)) = tasks.next().await {
+        while let Some((idx, call, mut outcome)) = tasks.next().await {
+            outcome.output.output = compact_tool_output(&outcome.output.output, 8_000);
             let ok = parse_ok(&outcome.output.output);
             self.emit(
                 EventKind::ToolResult,
@@ -208,6 +262,8 @@ impl AgentRunner {
                     "tool": call.function.name,
                     "tool_call_id": call.id,
                     "ok": ok,
+                    "arguments": tool_arguments_preview(&call),
+                    "error_code": extract_error_code(&outcome.output.output),
                     "output": outcome.output.output,
                 })),
             );
@@ -222,8 +278,28 @@ impl AgentRunner {
             gathered.push((idx, outcome));
         }
 
-        gathered.sort_by_key(|(idx, _)| *idx);
-        Ok(gathered.into_iter().map(|(_, item)| item.output).collect())
+        let mut outputs: Vec<Option<crate::backboard::models::ToolOutput>> = vec![None; total];
+        for (idx, item) in gathered {
+            outputs[idx] = Some(item.output);
+        }
+
+        Ok(outputs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                item.unwrap_or_else(|| crate::backboard::models::ToolOutput {
+                    tool_call_id: expected_call_ids
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| format!("missing-{idx}")),
+                    output: json!({
+                        "ok": false,
+                        "error": "tool execution missing output for tool call"
+                    })
+                    .to_string(),
+                })
+            })
+            .collect())
     }
 
     async fn ensure_session(&self) -> Result<AgentSession> {
@@ -393,6 +469,74 @@ fn truncate_for_status(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn tool_arguments_preview(call: &ToolCall) -> String {
+    match call.arguments_map() {
+        Ok(Value::Object(map)) if map.is_empty() => "{}".to_string(),
+        Ok(value) => truncate_for_status(&value.to_string(), 260),
+        Err(_) => call
+            .function
+            .arguments
+            .as_deref()
+            .map(|raw| truncate_for_status(raw, 260))
+            .unwrap_or_else(|| "{}".to_string()),
+    }
+}
+
+fn compact_tool_output(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
+    }
+
+    let preview_len = max_chars.saturating_sub(220).max(200);
+    let preview: String = raw.chars().take(preview_len).collect();
+    let parsed_ok = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(Value::as_bool))
+        .unwrap_or(false);
+
+    json!({
+        "ok": parsed_ok,
+        "truncated": true,
+        "total_chars": raw.chars().count(),
+        "preview": format!("{}...", preview),
+    })
+    .to_string()
+}
+
+fn extract_error_code(output: &str) -> Option<u16> {
+    let parsed = serde_json::from_str::<Value>(output).ok()?;
+    if parsed.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+
+    if let Some(code) = parsed
+        .pointer("/result/status_code")
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+    {
+        return Some(code);
+    }
+
+    parsed
+        .get("error")
+        .and_then(Value::as_str)
+        .and_then(parse_status_code_from_text)
+}
+
+fn parse_status_code_from_text(input: &str) -> Option<u16> {
+    let bytes = input.as_bytes();
+    for window in bytes.windows(3) {
+        if window.iter().all(u8::is_ascii_digit) && (window[0] == b'4' || window[0] == b'5') {
+            if let Ok(raw) = std::str::from_utf8(window) {
+                if let Ok(code) = raw.parse::<u16>() {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn retry_async<F, Fut, T>(attempts: usize, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -431,4 +575,11 @@ fn is_transient(err: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|marker| value.contains(marker))
+}
+
+fn is_missing_tool_result_error(err: &anyhow::Error) -> bool {
+    let value = err.to_string().to_lowercase();
+    value.contains("tool_use")
+        && value.contains("tool_result")
+        && value.contains("immediately after")
 }
